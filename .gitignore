@@ -1,0 +1,22 @@
+# Data and run outputs (large; not checked in)
+data/
+runs/
+*.npz
+!checkpoints/**/*.npz
+
+# Keep the shipped p7 checkpoint, ignore everything else heavy
+*.pt
+!checkpoints/**/*.pt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+._*
+.idea/
+.vscode/

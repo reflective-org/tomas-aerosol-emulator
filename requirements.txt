@@ -1,0 +1,4 @@
+# Core runtime. The p7 checkpoint was trained/evaluated with torch 2.5.1+cu121
+# on Python 3.10. Any torch >= 2.2 with a matching CUDA build should load it.
+torch>=2.2
+numpy>=1.24
