@@ -173,7 +173,7 @@ class ConservativeMultiHeadMLPV2(nn.Module):
             # total_n_log_clamp, the projection is a NO-OP. When the natural
             # pred exceeds that, it's pulled back to the boundary of the
             # allowed band. This catches pathological single-step jumps (e.g.
-            # the 6h p99 = 2e6 outlier in p7) WITHOUT fighting normal
+            # rare 6h total-N outliers) WITHOUT fighting normal
             # coag/nucleation dynamics (which produce small per-step changes).
             if self.total_n_log_clamp is not None:
                 log_Nk_sum_pred = torch.logsumexp(log_Nk_pred, dim=-1)   # (B,)

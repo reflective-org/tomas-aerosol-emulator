@@ -1,4 +1,8 @@
-# TOMAS Aerosol Microphysics Emulator (`p7`)
+# TOMAS Aerosol Microphysics Emulator
+
+> 🚧 **Status: active development.** This model is being actively improved —
+> accuracy, APIs, the shipped checkpoint, and reported numbers may change.
+> Treat current results as a strong baseline, not a final release.
 
 A neural surrogate for the **TOMAS** sectional aerosol microphysics model. Given
 the aerosol size distribution and the atmospheric state, it predicts how the
@@ -6,13 +10,14 @@ distribution evolves — nucleation, condensation, and coagulation — over a
 6-hour rollout, at a tiny fraction of the cost of integrating the stiff
 microphysics ODEs.
 
-`p7` is a **5.4M-parameter conservation-projected multi-head MLP**. It advances
-the state one 60-second step at a time and is rolled out autoregressively. A
-hard per-step sulfur-mass projection sits on top of the network so total sulfur
-is conserved exactly (to float32) regardless of what the network predicts.
+The model is a **5.4M-parameter conservation-projected multi-head MLP**. It
+advances the state one 60-second step at a time and is rolled out
+autoregressively. A hard per-step sulfur-mass projection sits on top of the
+network so total sulfur is conserved exactly (to float32) regardless of what the
+network predicts.
 
-This repository packages the trained `p7` champion together with everything
-needed to run, evaluate, and retrain it.
+This repository packages the trained model together with everything needed to
+run, evaluate, and retrain it.
 
 ---
 
@@ -38,13 +43,12 @@ Per-bin breakdown at 6 h (selected):
 |-----------------------|----------------------------|:--------------:|
 | Nucleation (0–5)      | violent particle formation | ~11–25 %       |
 | Accumulation (7–24)   | smooth growth              | ~5–13 %        |
-| Bin 25 (core/coarse boundary) | head-boundary artifact | ~60 %      |
+| Core/coarse boundary  | localized artifact (under improvement) | elevated |
 | Coarse (28–39)        | nearly static              | ~2–4 %         |
 
-> **Protocol note.** The masking metric is the one defined in `evaluate.py`. A
-> stricter alternative protocol (used elsewhere in the research line) reports
-> p7 at 11.2 % / 9.3 %. Numbers are only comparable under the *same* protocol —
-> always state which one you used.
+> **Protocol note.** The masking metric is the one defined in `evaluate.py`.
+> A stricter alternative protocol reports ~11.2 % / 9.3 %. Numbers are only
+> comparable under the *same* protocol — always state which one you used.
 
 ---
 
@@ -59,8 +63,8 @@ metrics.py               log-state -> physical conversion + the train/val split 
 model_multihead.py       TomasMultiHeadMLP: shared backbone + 4 region heads
 model_conserved_v2.py    ConservativeMultiHeadMLPV2: per-step sulfur-mass projection wrapper
 dataset_v4.py            v4 data loader (per-step conditioning, log-state, normalization)
-scripts/train_p7.sh      One-command reproduction of the final (chunk_len=60) phase
-checkpoints/p7/          The trained champion
+scripts/train.sh         One-command reproduction of the final (chunk_len=60) training stage
+checkpoints/             The trained model
   best_model.pt            weights + the exact training args
   norm_stats.pt            normalization statistics (required to run the model)
 docs/DATA.md             How the CESM-seeded v4 training data was generated
@@ -86,7 +90,7 @@ A GPU is recommended for rollout but not required (`--device cpu`).
 
 ```bash
 python evaluate.py \
-    --run-dir  checkpoints/p7 \
+    --run-dir  checkpoints \
     --data-dir /path/to/v4_repr_1M \
     --n-scenarios 500
 ```
@@ -107,8 +111,8 @@ from model_multihead import TomasMultiHeadMLP
 from model_conserved_v2 import ConservativeMultiHeadMLPV2
 
 device = "cuda"
-norm = NormStatsV4.load("checkpoints/p7/norm_stats.pt")
-ckpt = torch.load("checkpoints/p7/best_model.pt", weights_only=True, map_location=device)
+norm = NormStatsV4.load("checkpoints/norm_stats.pt")
+ckpt = torch.load("checkpoints/best_model.pt", weights_only=True, map_location=device)
 a = ckpt["args"]
 
 base = TomasMultiHeadMLP(
@@ -136,13 +140,13 @@ See `evaluate.py` for the complete, runnable rollout + de-normalization path.
 ### 3. Retrain
 
 ```bash
-# Final phase only (needs a p6 / chunk_len=32 checkpoint to warm-start from):
+# Final stage only (needs the previous, chunk_len=32, checkpoint to warm-start from):
 NPROC=7 DATA_DIR=/path/to/v4_repr_1M \
-    INIT_FROM=runs/p6/best_model.pt OUT_DIR=runs/p7 \
-    bash scripts/train_p7.sh
+    INIT_FROM=runs/prev/best_model.pt OUT_DIR=runs/main \
+    bash scripts/train.sh
 ```
 
-`p7` is the tail of a curriculum, not a from-scratch run — see below.
+The released model is the tail of a curriculum, not a from-scratch run — see below.
 
 ---
 
@@ -180,25 +184,26 @@ so a summed-forcing constraint would be wrong. See `docs/DATA.md`.
 
 ### Training curriculum
 
-`p7` is the last of a sequence of phases that grow the rollout horizon while
-warm-starting each phase from the previous best. Training a long horizon from
-scratch is unstable (exposure bias / gradient blow-ups); ramping it is not.
+The released model is the last of a sequence of stages that grow the rollout
+horizon while warm-starting each stage from the previous best. Training a long
+horizon from scratch is unstable (exposure bias / gradient blow-ups); ramping it
+is not.
 
-| Phase | chunk_len | init from |
+| Stage | chunk_len | init from |
 |------:|:---------:|-----------|
-| p1    | 2         | scratch   |
-| p2    | 4         | p1        |
-| p3    | 8         | p2        |
-| p4    | 12        | p3        |
-| p6    | 32        | p4        |
-| **p7**| **60**    | **p6**    |
+| 1     | 2         | scratch   |
+| 2     | 4         | stage 1   |
+| 3     | 8         | stage 2   |
+| 4     | 12        | stage 3   |
+| 5     | 32        | stage 4   |
+| **6** | **60**    | **stage 5** (released model) |
 
-Each phase uses a **hybrid loss**: log-MSE (with an inverse-variance weighting
+Each stage uses a **hybrid loss**: log-MSE (with an inverse-variance weighting
 floored to avoid amplifying empty-bin noise) plus a clipped relative-error term
 (`--relerr-weight 0.4`) to keep the metric the model is judged on in the
 objective. Pushforward steps (`--pushforward-steps 4`) train multi-step
-composition directly. The exact `p7` hyperparameters are baked into
-`scripts/train_p7.sh` and into `best_model.pt`'s saved `args`.
+composition directly. The exact final-stage hyperparameters are baked into
+`scripts/train.sh` and into `best_model.pt`'s saved `args`.
 
 > **Multi-GPU caveat.** `TomasMultiHeadMLP` under DDP **must** set
 > `broadcast_buffers=False` (the trainer does). With rank-0-only validation and
@@ -232,15 +237,18 @@ is a metric-side convention, not a clamp on the data.
 
 ---
 
-## Known limitations
+## Status and roadmap
 
-- **Median ~9 % at 6 h is a systematic floor** for this architecture/objective —
-  ensembling, more capacity, EMA, and a from-scratch transformer did not break
-  it. The remaining gap is dominated by the `t=0` nucleation transient.
-- **Bin 25** sits on the core/coarse head boundary and is a structural
-  artifact (~60 % rel-err); bin-weight up-weighting does not fix it.
-- The model conserves **sulfur mass**, not number; nucleation/coagulation
-  legitimately change number, and that is left to the network.
+This emulator is under active development. Accuracy is being actively improved;
+current focus areas:
+
+- **The `t=0` nucleation transient** — the dominant contributor to 6-hour error.
+  Finer first-step resolution and time conditioning are being explored.
+- **The core/coarse size-range boundary**, where the multi-head split currently
+  introduces a localized artifact.
+
+By design the model conserves **sulfur mass**, not number — nucleation and
+coagulation legitimately change particle number, which the network predicts.
 
 ---
 

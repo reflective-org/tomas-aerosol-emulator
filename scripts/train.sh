@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# Reproduce the p7 champion's final curriculum phase: chunk_len=60, initialized
-# from the p6 (chunk_len=32) checkpoint. This is the last and longest-horizon
-# stage of the rollout curriculum (see README "Training curriculum").
+# Reproduce the final curriculum stage: chunk_len=60, initialized from the
+# previous (chunk_len=32) checkpoint. This is the last and longest-horizon stage
+# of the rollout curriculum (see README "Training curriculum").
 #
-# p7 is NOT trained from scratch at chunk_len=60 -- it is the tail of a
-# curriculum that climbs chunk_len 1 -> 2 -> 4 -> 8 -> 12 -> 32 -> 60, each phase
-# warm-started from the previous best_model.pt. Run the earlier phases the same
-# way (only --chunk-len / --init-from / --out-dir change) to reproduce end-to-end.
+# The released model is NOT trained from scratch at chunk_len=60 -- it is the
+# tail of a curriculum that climbs chunk_len 2 -> 4 -> 8 -> 12 -> 32 -> 60, each
+# stage warm-started from the previous best_model.pt. Run the earlier stages the
+# same way (only --chunk-len / --init-from / --out-dir change) to reproduce
+# end-to-end.
 #
 # Usage:
-#   NPROC=7 DATA_DIR=data/v4_repr_1M INIT_FROM=runs/p6/best_model.pt \
-#     OUT_DIR=runs/p7 bash scripts/train_p7.sh
+#   NPROC=7 DATA_DIR=data/v4_repr_1M INIT_FROM=runs/prev/best_model.pt \
+#     OUT_DIR=runs/main bash scripts/train.sh
 set -euo pipefail
 
 NPROC="${NPROC:-1}"                                  # GPUs for DDP (orig: 7xH100)
 DATA_DIR="${DATA_DIR:-data/v4_repr_1M}"
-INIT_FROM="${INIT_FROM:-runs/p6/best_model.pt}"      # p6 (chunk_len=32) best
-OUT_DIR="${OUT_DIR:-runs/p7}"
+INIT_FROM="${INIT_FROM:-runs/prev/best_model.pt}"    # previous (chunk_len=32) best
+OUT_DIR="${OUT_DIR:-runs/main}"
 MASTER_PORT="${MASTER_PORT:-29519}"
 
 mkdir -p "$OUT_DIR"

@@ -275,7 +275,7 @@ def _grads_finite(m):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", default="data/v4_repr_1M")
-    p.add_argument("--out-dir", default="runs/p7")
+    p.add_argument("--out-dir", default="runs/main")
     p.add_argument("--max-scenarios", type=int, default=None)
     p.add_argument("--subsample-dt", type=int, default=1,
                    help="Subsample the trajectory timestep by this factor. 1 = "

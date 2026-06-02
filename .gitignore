@@ -2,11 +2,11 @@
 data/
 runs/
 *.npz
-!checkpoints/**/*.npz
+!checkpoints/*.npz
 
-# Keep the shipped p7 checkpoint, ignore everything else heavy
+# Keep the shipped checkpoint, ignore everything else heavy
 *.pt
-!checkpoints/**/*.pt
+!checkpoints/*.pt
 
 # Python
 __pycache__/

@@ -12,7 +12,7 @@ actually populated.
 Example
 -------
     python evaluate.py \
-        --run-dir checkpoints/p7 \
+        --run-dir checkpoints \
         --data-dir data/v4_repr_1M \
         --n-scenarios 500
 """
@@ -88,7 +88,7 @@ def channel_median_relerr(pred, gt, floor_tol, empty_frac):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--run-dir", default="checkpoints/p7",
+    p.add_argument("--run-dir", default="checkpoints",
                    help="dir with best_model.pt + norm_stats.pt")
     p.add_argument("--data-dir", default="data/v4_repr_1M",
                    help="root of v4 NPZ batches (t*/batch_*.npz)")
