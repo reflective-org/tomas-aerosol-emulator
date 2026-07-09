@@ -1,32 +1,146 @@
 # TOMAS Aerosol Microphysics Emulator
 
 > 🚧 **Status: active development.** This model is being actively improved —
-> accuracy, APIs, the shipped checkpoint, and reported numbers may change.
+> accuracy, APIs, the shipped checkpoints, and reported numbers may change.
 > Treat current results as a strong baseline, not a final release.
 
 A neural surrogate for the **TOMAS** sectional aerosol microphysics model. Given
 the aerosol size distribution and the atmospheric state, it predicts how the
 distribution evolves — nucleation, condensation, and coagulation — over a
-6-hour rollout, at a tiny fraction of the cost of integrating the stiff
+6-hour horizon, at a tiny fraction of the cost of integrating the stiff
 microphysics ODEs.
 
-The model is a **5.4M-parameter conservation-projected multi-head MLP**. It
-advances the state one 60-second step at a time and is rolled out
-autoregressively. A hard per-step sulfur-mass projection sits on top of the
-network so total sulfur is conserved exactly (to float32) regardless of what the
-network predicts.
+Two trained models are shipped:
 
-This repository packages the trained model together with everything needed to
-run, evaluate, and retrain it.
+| Model | Params | How it predicts | Use it when |
+|---|---|---|---|
+| **`checkpoints/axial_aug5` — axial trajectory operator (current best)** | 29.5M | **Non-autoregressive**: one forward pass maps the initial state + 6 h forcing to all 12 × 30-min states | You want the best accuracy, robustness on idealized / off-manifold initial conditions, or error that stays flat with horizon |
+| `checkpoints/` — conservation-projected multi-head MLP | 5.4M | Autoregressive 60-s steps with exact per-step sulfur-mass conservation | You want a small, fast per-step model or hard mass conservation |
 
 ---
 
-## Performance
+## The axial trajectory operator (`axial_aug5`) — current best
+
+`AxialTrajOperator` (`model_axial_traj.py`) treats the state as a **(12 time
+steps) × (41 tokens)** grid — 40 size-bin tokens (each carrying its number and
+mass) plus a gas token — and alternates **bin-axis attention** (all-pairs bin
+coupling, matching coagulation's N·N structure) with **bidirectional time-axis
+attention** (non-AR temporal composition with the full forcing in view). Because
+nothing is fed back autoregressively, rollout error does not compound: error is
+roughly **flat in horizon**, which is the single biggest reason it beats the
+AR baseline at 6 h.
+
+The released checkpoint is additionally **OOD-augmentation fine-tuned**: the
+base model is trained on CESM-seeded scenarios, then fine-tuned with idealized
+single-mode lognormal initial conditions sweeping the nucleation-burst-triggering
+corner of forcing space (high H₂SO₄, low condensation sink, cold T, ion-pair
+rate `fion` ∈ [0,5] including 0), mixed into the train pool only while
+validation stays pure CESM. This removes the OOD cliff on clean/idealized
+initial size distributions at ~2 pt in-distribution cost.
+
+### Performance
+
+Held-out CESM scenarios, pooled per-bin relative error in **physical space**
+(floor-masked — see *Why the floor matters* below). The base axial model's full
+profile at 6 h:
+
+| quantity | p50 | p90 | p99 |
+|---|---|---|---|
+| per-bin Nk | 0.031 | 0.216 | 1.21 |
+| per-bin Mk | 0.028 | 0.189 | 1.26 |
+| total number | 0.029 | 0.110 | — |
+| total sulfate mass | 0.006 | 0.028 | — |
+| gas-phase H₂SO₄ | 0.006 | 0.058 | — |
+
+The shipped `axial_aug5` fine-tune holds this at Nk p50/p90 **0.035 / 0.218**
+while transforming out-of-distribution behaviour — on idealized lognormal-IC
+scenarios the pre-augmentation model was off by up to ~50× on burst regimes;
+`axial_aug5` brings most idealized regimes to in-distribution quality (p90
+0.10–0.48). The remaining hard tail is pure-binary nucleation at high N and
+high H₂SO₄. Inference: ~467 µs/scenario on an H100 (~76× faster than the
+native box model).
+
+### Get the checkpoint
+
+The weights are ~113 MB, over GitHub's 100 MB in-repo limit, so they ship as a
+**release asset**:
+
+```bash
+bash scripts/download_axial_checkpoint.sh
+# -> checkpoints/axial_aug5/best_model.pt  (norm_stats.pt is already in the repo)
+```
+
+### Evaluate
+
+```bash
+RUN_DIR=checkpoints/axial_aug5 DATA_DIR=/path/to/v4_repr_1M python evaluate_axial.py
+```
+
+### Inference in your own code
+
+State layout is `[log Nk(40) ‖ log Mk_SO4(40) ‖ log Gc_H2SO4(1)]`, normalized
+with the shipped stats. Conditioning is `[pres, nh3_conc, T, RH, H2SO4_vmr,
+fion]` at the 13 grid times (minutes 0, 30, …, 360).
+
+```python
+import torch
+from dataset_v4 import NormStatsV4
+from model_axial_traj import AxialTrajOperator
+
+device = "cuda"
+norm = NormStatsV4.load("checkpoints/axial_aug5/norm_stats.pt")
+ck = torch.load("checkpoints/axial_aug5/best_model.pt", weights_only=False, map_location=device)
+ma = ck["args"]
+n_cond = ck["model_state_dict"]["cond_in.weight"].shape[1]      # 6 (with fion)
+
+model = AxialTrajOperator(
+    d_model=ma["d_model"], nhead=ma["nhead"], num_blocks=ma["num_blocks"],
+    dim_ff=ma["dim_ff"], dropout=0.0, ff_experts=ma.get("ff_experts", 1),
+    n_out=12, n_cond=n_cond,
+).to(device)
+model.load_state_dict(ck["model_state_dict"]); model.eval()
+
+# state0_norm: (B, 81)    normalized log-state at t=0
+# cond_norm:   (B, 13, 6) normalized conditioning at minutes [0, 30, ..., 360]
+with torch.no_grad():
+    traj = model(state0_norm, cond_norm)   # (B, 12, 81): minutes 30, 60, ..., 360
+# physical: metrics.log_state_to_physical(norm.denormalize_state(traj))
+```
+
+See `evaluate_axial.py` for the complete, runnable path including
+normalization.
+
+### Retrain / fine-tune
+
+```bash
+# OOD-augmentation fine-tune (the released model's final stage):
+NPROC=7 DATA_DIR=/path/to/v4_repr_1M AUG_DIR=/path/to/v4_aug \
+    WARM_START=runs/axial_base/best_model.pt \
+    BASE_NORM=runs/axial_base/norm_stats.pt \
+    OUT_DIR=runs/axial_aug5 bash scripts/train_axial_aug5.sh
+```
+
+Two hard-won details are baked into that script — read its header before
+changing it: **normalization statistics must be frozen from the base model**
+(recomputing them on a mixed CESM+augmentation pool shifts the state mean past
+1σ and warm-started weights never recover), and the 6th forcing channel
+(`fion`) is zero-padded into a 5-channel warm-start so training begins
+numerically identical to the base model.
+
+---
+
+## The MLP baseline (`checkpoints/`)
+
+A **5.4M-parameter conservation-projected multi-head MLP**. It advances the
+state one 60-second step at a time and is rolled out autoregressively. A hard
+per-step sulfur-mass projection sits on top of the network so total sulfur is
+conserved exactly (to float32) regardless of what the network predicts.
+
+### Performance
 
 Autoregressive rollout on 500 held-out scenarios, median per-bin relative error
-in **physical space** (bins that sit at the empty-bin floor for most of the
-horizon are masked — see *Why the floor matters* below). These are the numbers
-`evaluate.py` reproduces from the shipped checkpoint:
+in **physical space**. These are the numbers `evaluate.py` reproduces from the
+shipped checkpoint:
 
 | Horizon | Number (Nk) median rel-err | Mass (Mk) median rel-err |
 |--------:|:--------------------------:|:------------------------:|
@@ -37,56 +151,11 @@ horizon are masked — see *Why the floor matters* below). These are the numbers
 Scenario-level (median across the 32 scored bins, per scenario) at 6 h:
 **p50 = 9.4 %, p90 = 44.9 %.**
 
-Per-bin breakdown at 6 h (selected):
-
-| Bin region            | Behaviour                  | Median rel-err |
-|-----------------------|----------------------------|:--------------:|
-| Nucleation (0–5)      | violent particle formation | ~11–25 %       |
-| Accumulation (7–24)   | smooth growth              | ~5–13 %        |
-| Core/coarse boundary  | localized artifact (under improvement) | elevated |
-| Coarse (28–39)        | nearly static              | ~2–4 %         |
-
 > **Protocol note.** The masking metric is the one defined in `evaluate.py`.
 > A stricter alternative protocol reports ~11.2 % / 9.3 %. Numbers are only
 > comparable under the *same* protocol — always state which one you used.
 
----
-
-## Repository layout
-
-```
-README.md                Project overview, performance, and instructions (this file)
-requirements.txt         Runtime dependencies (torch, numpy)
-train.py                 Trainer (rollout curriculum, conservation projection, hybrid loss)
-evaluate.py              Rollout evaluation -> per-channel median relative error
-metrics.py               log-state -> physical conversion + the train/val split helper
-model_multihead.py       TomasMultiHeadMLP: shared backbone + 4 region heads
-model_conserved_v2.py    ConservativeMultiHeadMLPV2: per-step sulfur-mass projection wrapper
-dataset_v4.py            v4 data loader (per-step conditioning, log-state, normalization)
-scripts/train.sh         One-command reproduction of the final (chunk_len=60) training stage
-checkpoints/             The trained model
-  best_model.pt            weights + the exact training args
-  norm_stats.pt            normalization statistics (required to run the model)
-docs/DATA.md             How the CESM-seeded v4 training data was generated
-```
-
----
-
-## Install
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt        # torch>=2.2, numpy
-```
-
-The checkpoint was produced with **Python 3.10 / torch 2.5.1+cu121** on H100s.
-A GPU is recommended for rollout but not required (`--device cpu`).
-
----
-
-## Quickstart
-
-### 1. Evaluate the shipped checkpoint
+### Evaluate
 
 ```bash
 python evaluate.py \
@@ -98,11 +167,10 @@ python evaluate.py \
 Prints the 1 h / 3 h / 6 h table above. `--val-frac 0.05 --seed 0` must match
 training (they are the defaults) so evaluation runs on truly held-out scenarios.
 
-### 2. Run inference in your own code
+### Inference in your own code
 
 The model maps a **normalized** `[state(81) ‖ cond(5)]` vector to the next
-normalized log-state. State layout is `[log Nk(40) ‖ log Mk_SO4(40) ‖ log Gc_H2SO4(1)]`;
-conditioning is `[pres, nh3_conc, T, RH, H2SO4_vmr]`.
+normalized log-state.
 
 ```python
 import torch
@@ -135,22 +203,10 @@ with torch.no_grad():
 # physical values: metrics.log_state_to_physical(norm.denormalize_state(cur))
 ```
 
-See `evaluate.py` for the complete, runnable rollout + de-normalization path.
+This model predates the `fion` conditioning channel; its checkpoint uses the
+first 5 cond channels (`evaluate.py` slices automatically).
 
-### 3. Retrain
-
-```bash
-# Final stage only (needs the previous, chunk_len=32, checkpoint to warm-start from):
-NPROC=7 DATA_DIR=/path/to/v4_repr_1M \
-    INIT_FROM=runs/prev/best_model.pt OUT_DIR=runs/main \
-    bash scripts/train.sh
-```
-
-The released model is the tail of a curriculum, not a from-scratch run — see below.
-
----
-
-## Model
+### Architecture
 
 ```
 input  [ state(81) ‖ cond(5) ]  = 86 normalized features
@@ -202,13 +258,60 @@ Each stage uses a **hybrid loss**: log-MSE (with an inverse-variance weighting
 floored to avoid amplifying empty-bin noise) plus a clipped relative-error term
 (`--relerr-weight 0.4`) to keep the metric the model is judged on in the
 objective. Pushforward steps (`--pushforward-steps 4`) train multi-step
-composition directly. The exact final-stage hyperparameters are baked into
-`scripts/train.sh` and into `best_model.pt`'s saved `args`.
+composition directly. Reproduce the final stage with:
+
+```bash
+NPROC=7 DATA_DIR=/path/to/v4_repr_1M \
+    INIT_FROM=runs/prev/best_model.pt OUT_DIR=runs/main \
+    bash scripts/train.sh
+```
 
 > **Multi-GPU caveat.** `TomasMultiHeadMLP` under DDP **must** set
 > `broadcast_buffers=False` (the trainer does). With rank-0-only validation and
 > the default `broadcast_buffers=True`, NCCL desyncs and surfaces as spurious
 > CUDA "index out of bounds" asserts.
+
+---
+
+## Repository layout
+
+```
+README.md                  Project overview, performance, and instructions (this file)
+requirements.txt           Runtime dependencies (torch, numpy)
+
+model_axial_traj.py        AxialTrajOperator: non-AR bin×time axial-attention operator
+train_axial_aug.py         Axial trainer (base training + OOD-augmentation fine-tune)
+evaluate_axial.py          Held-out evaluation of an axial checkpoint
+burst_feats.py             Analytic Dunne nucleation-rate feature (optional cond channel)
+scripts/train_axial_aug5.sh          Reproduce the released augmentation fine-tune
+scripts/download_axial_checkpoint.sh Fetch the ~113 MB axial weights (release asset)
+checkpoints/axial_aug5/    The axial model
+  best_model.pt              weights (NOT in git -- download via the script above)
+  norm_stats.pt              normalization statistics (required; frozen from base model)
+
+train.py                   MLP trainer (rollout curriculum, conservation projection)
+evaluate.py                MLP rollout evaluation -> per-channel median relative error
+model_multihead.py         TomasMultiHeadMLP: shared backbone + 4 region heads
+model_conserved_v2.py      ConservativeMultiHeadMLPV2: per-step sulfur-mass projection
+scripts/train.sh           One-command reproduction of the final MLP training stage
+checkpoints/               The MLP model
+  best_model.pt              weights + the exact training args
+  norm_stats.pt              normalization statistics (required to run the model)
+
+metrics.py                 log-state -> physical conversion + train/val split helper
+dataset_v4.py              v4 data loader (log-state, normalization, 6 cond channels)
+docs/DATA.md               How the CESM-seeded v4 training data was generated
+```
+
+## Install
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt        # torch>=2.2, numpy
+```
+
+The checkpoints were produced with **Python 3.10 / torch 2.5.1+cu121** on
+H100s. A GPU is recommended but not required.
 
 ---
 
@@ -224,31 +327,37 @@ v4_repr_1M/
   t<cellid>/batch_s<scenario>_b<batch>.npz   # Nk, Mk, Gc, evolving cond
 ```
 
-`docs/DATA.md` documents the generation pipeline and schema in full.
+`docs/DATA.md` documents the generation pipeline and schema in full. The loader
+also reads an optional per-scenario `fion` (ion-pair formation rate) key,
+defaulting to 3.0 for older data that lacks it.
 
 ### Why the floor matters
 
 Empty size bins sit at a numerical floor (`LOG_EPS = 1e-30`; coarse bins often
 park at ~`1e-5` for >50 % of a rollout). A relative-error metric over those bins
-divides by ~floor and explodes meaninglessly. `evaluate.py` therefore masks any
-bin that is at the floor for more than `--empty-frac` (default 50 %) of the
-horizon, so the reported median reflects bins that actually carry signal. This
-is a metric-side convention, not a clamp on the data.
+divides by ~floor and explodes meaninglessly. Both evaluators therefore mask any
+bin that is at the floor for more than half the horizon, so the reported median
+reflects bins that actually carry signal. This is a metric-side convention, not
+a clamp on the data.
 
 ---
 
 ## Status and roadmap
 
-This emulator is under active development. Accuracy is being actively improved;
-current focus areas:
+This emulator is under active development. Current focus areas:
 
-- **The `t=0` nucleation transient** — the dominant contributor to 6-hour error.
-  Finer first-step resolution and time conditioning are being explored.
-- **The core/coarse size-range boundary**, where the multi-head split currently
-  introduces a localized artifact.
+- **The in-distribution per-bin p90 < 0.10 target** — limited by the
+  sensitivity/ill-conditioning of the nucleation-burst flow map, not by model
+  capacity or data volume; a physics-in-loop hybrid (exact burst source term)
+  is the identified route.
+- **The pure-binary high-N / high-H₂SO₄ OOD tail** — broader augmentation
+  coverage.
+- **Throughput** — distilling the axial model to a smaller axial student.
 
-By design the model conserves **sulfur mass**, not number — nucleation and
-coagulation legitimately change particle number, which the network predicts.
+By design the MLP baseline conserves **sulfur mass** exactly; the axial model
+learns conservation to ~0.6 % (total sulfate p50) without a hard constraint.
+Neither conserves number — nucleation and coagulation legitimately change
+particle number, which the networks predict.
 
 ---
 

@@ -121,6 +121,10 @@ def main():
           f"chunk_len={ma.get('chunk_len')}, pf={ma.get('pushforward_steps')}, "
           f"relerr_weight={ma.get('relerr_weight')}")
 
+    # the dataset may carry more cond channels than this checkpoint was trained
+    # on (e.g. fion was added for the axial model); keep the model's width
+    cond_t = cond_t[..., :norm_stats.cond_mean.shape[-1]]
+
     states_norm = norm_stats.normalize_state(
         torch.as_tensor(log_states, dtype=torch.float32)).to(device)
     cond_norm = norm_stats.normalize_cond(
