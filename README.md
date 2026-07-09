@@ -30,6 +30,10 @@ nothing is fed back autoregressively, rollout error does not compound: error is
 roughly **flat in horizon**, which is the single biggest reason it beats the
 AR baseline at 6 h.
 
+**`docs/ARCHITECTURE.md` walks through the whole model piece by piece** —
+tokenization, the axial block, the mixture-of-experts FFN, the
+persistence-residual head, and a tensor-shape cheat sheet.
+
 The released checkpoint is additionally **OOD-augmentation fine-tuned**: the
 base model is trained on CESM-seeded scenarios, then fine-tuned with idealized
 single-mode lognormal initial conditions sweeping the nucleation-burst-triggering
@@ -300,6 +304,7 @@ checkpoints/               The MLP model
 
 metrics.py                 log-state -> physical conversion + train/val split helper
 dataset_v4.py              v4 data loader (log-state, normalization, 6 cond channels)
+docs/ARCHITECTURE.md       Piece-by-piece walkthrough of the axial operator
 docs/DATA.md               How the CESM-seeded v4 training data was generated
 ```
 
