@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REPO="MShreyas1/tomas-aerosol-emulator"
-TAG="${TAG:-axial-aug5}"
+TAG="${TAG:-axial-aug5-weights}"
 DEST="checkpoints/axial_aug5/best_model.pt"
 
 if [ -f "$DEST" ]; then
