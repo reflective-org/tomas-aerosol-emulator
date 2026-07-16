@@ -15,7 +15,7 @@ from pathlib import Path
 
 N_BINS = 40
 N_STATE = 81           # 40 Nk + 40 Mk_SO4 + 1 Gc_H2SO4
-N_COND = 5             # pres, nh3_conc, T, RH, H2SO4_vmr
+N_COND = 6             # pres, nh3_conc, T, RH, H2SO4_vmr, fion  (fion=3.0 default for CESM v4 lacking the key)
 N_STEPS = 361          # 0..360 over 6h
 LOG_EPS = 1e-30
 
@@ -70,6 +70,7 @@ def load_v4_batches(root, max_scenarios=None, verbose=True, rank=0, world_size=1
         H2SO4_h = d["H2SO4_vmr_hourly"].T
         pres = d["pres"]
         nh3 = d["nh3_conc"]
+        fion = d["fion"] if "fion" in d.files else np.full(Nk.shape[0], 3.0, np.float32)
         B = Nk.shape[0]
 
         # Drop scenarios with any NaN/Inf in the rollout outputs (should be 0 per scan)
@@ -84,7 +85,7 @@ def load_v4_batches(root, max_scenarios=None, verbose=True, rank=0, world_size=1
                 print(f"  {f.name}: dropped {n_bad}/{B} non-finite scenarios")
             Nk = Nk[valid]; Mk = Mk[valid]; Gc = Gc[valid]
             T_h = T_h[valid]; RH_h = RH_h[valid]; H2SO4_h = H2SO4_h[valid]
-            pres = pres[valid]; nh3 = nh3[valid]
+            pres = pres[valid]; nh3 = nh3[valid]; fion = fion[valid]
             B = Nk.shape[0]
 
         T_step = _interp_hourly_to_steps(T_h)
@@ -97,6 +98,7 @@ def load_v4_batches(root, max_scenarios=None, verbose=True, rank=0, world_size=1
         cond[:, :, 2] = T_step
         cond[:, :, 3] = RH_step
         cond[:, :, 4] = H2SO4_step
+        cond[:, :, 5] = fion[:, None]
 
         Nk_l.append(Nk); Mk_l.append(Mk); Gc_l.append(Gc); cond_l.append(cond)
         total += B

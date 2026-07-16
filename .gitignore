@@ -4,9 +4,15 @@ runs/
 *.npz
 !checkpoints/*.npz
 
-# Keep the shipped checkpoint, ignore everything else heavy
+# Keep the shipped checkpoints, ignore everything else heavy.
+# checkpoints/axial_aug5/best_model.pt is deliberately NOT tracked: it is
+# ~113 MB (over GitHub's 100 MB limit) and ships as a release asset instead
+# (scripts/download_axial_checkpoint.sh).
 *.pt
 !checkpoints/*.pt
+!checkpoints/axial_aug5/norm_stats.pt
+# dt_champion weights are 21 MB — under GitHub's limit, shipped in-repo.
+!checkpoints/dt_champion/*.pt
 
 # Python
 __pycache__/
