@@ -14,8 +14,51 @@ Two trained models are shipped:
 
 | Model | Params | How it predicts | Use it when |
 |---|---|---|---|
-| **`checkpoints/axial_aug5` — axial trajectory operator (current best)** | 29.5M | **Non-autoregressive**: one forward pass maps the initial state + 6 h forcing to all 12 × 30-min states | You want the best accuracy, robustness on idealized / off-manifold initial conditions, or error that stays flat with horizon |
-| `checkpoints/` — conservation-projected multi-head MLP | 5.4M | Autoregressive 60-s steps with exact per-step sulfur-mass conservation | You want a small, fast per-step model or hard mass conservation |
+| **`checkpoints/axial_cons2` — long-range / physically-constrained axial (this branch)** | 29.5M | Same non-autoregressive operator, fine-tuned with two-window pushforward and a monotonicity constraint | You **chain past 6 h**, or need sulfur mass never to be destroyed. 4.4× better at 24 h; costs ~10% at 6 h |
+| `checkpoints/axial_aug5` — axial trajectory operator | 29.5M | **Non-autoregressive**: one forward pass maps the initial state + 6 h forcing to all 12 × 30-min states | You only need a single 6 h window and want the best accuracy there |
+| `checkpoints/` — conservation-projected multi-head MLP | 5.4M | Autoregressive 60-s steps with exact per-step sulfur-mass conservation | You want a small, fast per-step model |
+
+---
+
+## Long-range chaining and mass conservation (`axial_cons2`)
+
+The 6 h operator reaches longer horizons by **chaining**: the 6 h output becomes
+the next window's initial condition. Measured against 24 h TOMAS ground truth
+(`gen_longhorizon.py`), the base model's *per-window* skill is flat out to 19 h,
+but chaining it triples the error — the failure is exposure bias, not skill. It
+also destroys sulfur: over a free-running 7-day chain one cell lost **92%** of
+its mass, which the box model's physics forbids.
+
+`axial_cons2` fine-tunes the base model with two-window pushforward, interior
+window starts, and a hard **monotonicity** constraint (ΣMk can never decrease —
+exact on ground truth to the float32 floor, unlike the sulfur *equality* budget,
+which is wrong at Δt = 30 and is refuted in the doc below).
+
+| | `axial_aug5` | `axial_cons2` + `mono` |
+|---|---|---|
+| 6 h per-bin Nk p90 | **0.236** | 0.259 |
+| 24 h chained Nk p90 | 0.345 | **0.078** |
+| 24 h chained, unseen season | 0.408 | **0.109** |
+| 24 h chained total-mass p90 | 0.096 | **0.015** |
+| chained monotonicity violations | 59% | **8%** |
+| 7-day mass ratio M(7d)/M(0) | 0.075 … 2.64 (destroys mass) | **1.05 … 3.25 (never destroys)** |
+
+```python
+from model_axial_traj import AxialTrajOperator
+from model_conserved_axial import ConservativeAxialTraj
+
+net = ConservativeAxialTraj(base_model, norm_stats, mode="mono")   # drop-in wrapper
+```
+
+The constraint also works **post-hoc on any checkpoint** (on `axial_aug5` it costs
++0.004 Mk p90 and cuts violations from 25% to 8%), so you can enable it without
+retraining.
+
+Evaluate a chained rollout with `evaluate_chain.py`, which reports both
+self-chained and GT-restarted error so compounding is separated from per-window
+skill. **`docs/CONSERVATION_LONGRANGE.md` has the full study**, including what was
+tried and refuted, and a known initial-condition bug that matters if you couple
+this to CESM.
 
 ---
 
