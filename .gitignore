@@ -2,21 +2,17 @@
 data/
 runs/
 *.npz
-!checkpoints/*.npz
+!checkpoints/norm_stats.npz
 
-# Keep the shipped checkpoint, ignore everything else heavy
+# Shipped checkpoints only (8.6 MB and 28.7 MB, under GitHub's 100 MB limit)
 *.pt
-!checkpoints/*.pt
+!checkpoints/bintf_d384_l6/avg_top3.pt
+!checkpoints/bintf_d256_l4/avg_top3.pt
 
-# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
-*.egg-info/
-
-# OS / editor
 .DS_Store
-._*
 .idea/
 .vscode/

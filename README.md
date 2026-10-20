@@ -1,257 +1,129 @@
-# TOMAS Aerosol Microphysics Emulator
+# TOMAS Aerosol Microphysics Emulator — bin-token transformers
 
-> 🚧 **Status: active development.** This model is being actively improved —
-> accuracy, APIs, the shipped checkpoint, and reported numbers may change.
-> Treat current results as a strong baseline, not a final release.
+> **Status: active development.** Accuracy, APIs and the shipped checkpoints may change.
 
-A neural surrogate for the **TOMAS** sectional aerosol microphysics model. Given
-the aerosol size distribution and the atmospheric state, it predicts how the
-distribution evolves — nucleation, condensation, and coagulation — over a
-6-hour rollout, at a tiny fraction of the cost of integrating the stiff
-microphysics ODEs.
+A neural surrogate for the **TOMAS** sectional aerosol microphysics model (40 mass-doubling
+bins, binary H₂SO₄–H₂O nucleation, coagulation, condensation, SO₂ + OH chemistry). Given a
+box's size distribution, gases and the forcing over the next 6 hours, it returns the
+state every 30 minutes through those 6 hours. Longer horizons are chained block by block.
 
-The model is a **5.4M-parameter conservation-projected multi-head MLP**. It
-advances the state one 60-second step at a time and is rolled out
-autoregressively. A hard per-step sulfur-mass projection sits on top of the
-network so total sulfur is conserved exactly (to float32) regardless of what the
-network predicts.
+**This branch ships two bin-token transformers** trained with the same recipe at two sizes:
 
-This repository packages the trained model together with everything needed to
-run, evaluate, and retrain it.
+| checkpoint | d × layers | params | cost (fp16, compiled, H200) | 6 h totals N · M (p50/p90) | day-14 injection N · M (p50/p90) |
+|---|---|---|---|---|---|
+| `checkpoints/bintf_d384_l6` (**production**) | 384 × 6 | 7.16 M | **2.9 µs/cell** | 3.1/16 · 2.6/13 % | 20/68 · 10/36 % |
+| `checkpoints/bintf_d256_l4` (fast) | 256 × 4 | 2.15 M | **1.1 µs/cell** | 4.7/25 · 4.9/23 % | 17/71 · 10/46 % |
 
----
+Error = |emulator − TOMAS| / TOMAS on held-out burst cells of the SAI injection population
+(the hardest cells), chained self-rollout from the initial state. Quiet background cells are
+at 0.1 % at 6 h. 1.5 M grid cells × one 6-hour step take 4.3 s (d384) or 1.7 s (d256) on one
+H200, versus 24–74 s for the TOMAS-JAX fast solver.
 
-## Performance
+Both checkpoints are the weight average of the three best epochs of their finishing run
+(`avg_of` inside the file). Both use the same `checkpoints/norm_stats.npz`; never recompute it.
 
-Autoregressive rollout on 500 held-out scenarios, median per-bin relative error
-in **physical space** (bins that sit at the empty-bin floor for most of the
-horizon are masked — see *Why the floor matters* below). These are the numbers
-`evaluate.py` reproduces from the shipped checkpoint:
-
-| Horizon | Number (Nk) median rel-err | Mass (Mk) median rel-err |
-|--------:|:--------------------------:|:------------------------:|
-| 1 h     | 8.4 %                      | 5.9 %                    |
-| 3 h     | 10.5 %                     | 7.8 %                    |
-| **6 h** | **12.5 %**                 | **10.7 %**               |
-
-Scenario-level (median across the 32 scored bins, per scenario) at 6 h:
-**p50 = 9.4 %, p90 = 44.9 %.**
-
-Per-bin breakdown at 6 h (selected):
-
-| Bin region            | Behaviour                  | Median rel-err |
-|-----------------------|----------------------------|:--------------:|
-| Nucleation (0–5)      | violent particle formation | ~11–25 %       |
-| Accumulation (7–24)   | smooth growth              | ~5–13 %        |
-| Core/coarse boundary  | localized artifact (under improvement) | elevated |
-| Coarse (28–39)        | nearly static              | ~2–4 %         |
-
-> **Protocol note.** The masking metric is the one defined in `evaluate.py`.
-> A stricter alternative protocol reports ~11.2 % / 9.3 %. Numbers are only
-> comparable under the *same* protocol — always state which one you used.
-
----
-
-## Repository layout
-
-```
-README.md                Project overview, performance, and instructions (this file)
-requirements.txt         Runtime dependencies (torch, numpy)
-train.py                 Trainer (rollout curriculum, conservation projection, hybrid loss)
-evaluate.py              Rollout evaluation -> per-channel median relative error
-metrics.py               log-state -> physical conversion + the train/val split helper
-model_multihead.py       TomasMultiHeadMLP: shared backbone + 4 region heads
-model_conserved_v2.py    ConservativeMultiHeadMLPV2: per-step sulfur-mass projection wrapper
-dataset_v4.py            v4 data loader (per-step conditioning, log-state, normalization)
-scripts/train.sh         One-command reproduction of the final (chunk_len=60) training stage
-checkpoints/             The trained model
-  best_model.pt            weights + the exact training args
-  norm_stats.pt            normalization statistics (required to run the model)
-docs/DATA.md             How the CESM-seeded v4 training data was generated
-```
-
----
-
-## Install
+## Quick start
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt        # torch>=2.2, numpy
+pip install -r requirements.txt
+python example.py                      # 10 ppbv SO2 pulse into a dense layer, 48 h, d384
+python example.py --ckpt bintf_d256_l4 --hours 336
 ```
-
-The checkpoint was produced with **Python 3.10 / torch 2.5.1+cu121** on H100s.
-A GPU is recommended for rollout but not required (`--device cpu`).
-
----
-
-## Quickstart
-
-### 1. Evaluate the shipped checkpoint
-
-```bash
-python evaluate.py \
-    --run-dir  checkpoints \
-    --data-dir /path/to/v4_repr_1M \
-    --n-scenarios 500
-```
-
-Prints the 1 h / 3 h / 6 h table above. `--val-frac 0.05 --seed 0` must match
-training (they are the defaults) so evaluation runs on truly held-out scenarios.
-
-### 2. Run inference in your own code
-
-The model maps a **normalized** `[state(81) ‖ cond(5)]` vector to the next
-normalized log-state. State layout is `[log Nk(40) ‖ log Mk_SO4(40) ‖ log Gc_H2SO4(1)]`;
-conditioning is `[pres, nh3_conc, T, RH, H2SO4_vmr]`.
 
 ```python
-import torch
-from dataset_v4 import NormStatsV4
-from model_multihead import TomasMultiHeadMLP
-from model_conserved_v2 import ConservativeMultiHeadMLPV2
+from normalization import state_to_log, cond_to_log, log_to_state
+from inference import load_model, rollout
 
-device = "cuda"
-norm = NormStatsV4.load("checkpoints/norm_stats.pt")
-ckpt = torch.load("checkpoints/best_model.pt", weights_only=True, map_location=device)
-a = ckpt["args"]
-
-base = TomasMultiHeadMLP(
-    hidden_dim=a["hidden_dim"], n_backbone_layers=a["n_layers"],
-    head_hidden_dim=a["head_hidden_dim"], nuc_head_hidden_dim=a["nuc_head_hidden_dim"],
-    n_cond=5, core_end_excl=a.get("core_end_excl", 26),
-).to(device)
-base.load_state_dict(ckpt["model_state_dict"]); base.eval()
-
-model = ConservativeMultiHeadMLPV2(
-    base, norm, log_factor_clamp=a["log_factor_clamp"], n_iter=a["proj_n_iter"],
-).to(device).eval()
-
-# Autoregressive rollout (state_norm: (B,81), cond_norm: (B, T, 5)) -- both normalized.
-cur = state_norm
-with torch.no_grad():
-    for t in range(T):
-        x = torch.cat([cur, cond_norm[:, t]], dim=-1)
-        cur = model(x).clamp(-20, 20)          # next normalized log-state
-# physical values: metrics.log_state_to_physical(norm.denormalize_state(cur))
+emu  = load_model("checkpoints/bintf_d384_l6")          # fp16 autocast + torch.compile
+s0   = state_to_log(Nk, Mk, h2so4_kg, so2_kg)           # (B, 82)  per-box quantities, floors applied
+cond = cond_to_log(pres_pa, temp_k, rh, oh_cm3)         # (B, 13, 6) for one block, (B, 12K+1, 6) for K blocks
+traj = rollout(emu, s0, cond)                           # (B, 12K+1, 82) log-states every 30 min
+state_6h = log_to_state(traj[:, 12])                    # dict: Nk, Mk, h2so4_kg, so2_kg
 ```
 
-See `evaluate.py` for the complete, runnable rollout + de-normalization path.
+## What the model computes
 
-### 3. Retrain
+**Input.** One box, one 6-hour step: the 82-value state at t = 0 (40 bin numbers, 40 bin
+sulfate masses, H₂SO₄ gas, SO₂ gas, all as logs of per-box quantities, box = 1 m³) and the
+forcing at 13 points, t = 0, 0.5, …, 6 h: pressure, temperature, relative humidity, OH, an
+SO₂ source rate and a dilution rate. **Only the 6 hours of forcing are needed for a 6-hour
+step.** The state and forcing layout, units and floors are documented in `normalization.py`.
 
-```bash
-# Final stage only (needs the previous, chunk_len=32, checkpoint to warm-start from):
-NPROC=7 DATA_DIR=/path/to/v4_repr_1M \
-    INIT_FROM=runs/prev/best_model.pt OUT_DIR=runs/main \
-    bash scripts/train.sh
-```
+**Output.** 12 states, one every 30 minutes, the last being the 6-hour state. The network is
+a transformer over 42 tokens (40 bins + 2 gases); each token carries its bin's number and
+mass plus the gases and the whole forcing window, attention runs across bins, and the head
+emits all 12 time steps at once as a residual on the initial state. Nothing is stepped
+through time inside a block, which is where the speed comes from (`bintf_model.py`).
 
-The released model is the tail of a curriculum, not a from-scratch run — see below.
+**Chaining.** For a longer horizon the 6-hour output becomes the next block's initial state,
+with the next 13 forcing points (`inference.rollout`). The checkpoints were trained on chains
+up to 56 blocks (14 days), so chained rollouts stay bounded; the error numbers above are
+chained self-rollouts.
 
----
+## Floors (load-bearing)
 
-## Model
+The training corpus contains no zeros. A zero pushed through the log is many standard
+deviations outside the training distribution and the network returns nonsense. Two floors
+were found in a coupled climate run and are applied by `state_to_log` / `cond_to_log`:
 
-```
-input  [ state(81) ‖ cond(5) ]  = 86 normalized features
-          │
-   shared backbone : 5 × Linear(1024) + GELU
-          ├── nucleation head (bins 0–5)   → 12 outputs   2-layer MLP, hidden 512
-          ├── core head       (bins 6–25)  → 40 outputs   2-layer MLP, hidden 256
-          ├── coarse head     (bins 26–39) → 28 outputs   2-layer MLP, hidden 256
-          └── Gc head          (gas H2SO4) →  1 output
-          │  (per-head residual over the matching state indices)
-output [ next log-state(81) ]
-          │
-   ConservativeMultiHeadMLPV2 : per-step projection so
-   Σ Mk[t+1] + Gc[t+1] = Σ Mk[t] + H2SO4_forced[t]   (sulfur mass conserved)
-```
+- **SO₂ ≥ 1e-17 kg/box.** A zero SO₂ encoded at 1e-30 is 7σ out and produced 1660× the
+  physics' aerosol mass in that cell.
+- **OH ≥ 100 molec/cm³.** Night-time OH of exactly zero is 17σ out and produced spurious
+  1e8 cm⁻³ nucleation bursts in every polar cell.
 
-Why region heads: nucleation, accumulation, and coarse bins have very different
-dynamics (the nucleation bins fire violently at `t=0`; coarse bins barely move).
-Splitting them lets each head specialize. The boundary between the core and
-coarse heads is configurable (`core_end_excl`).
+Also: Nk ≥ 1e-20 /box, Mk and gases ≥ 1e-30 kg/box, RH clipped to [1e-3, 1].
 
-### Conservation projection
+## Precision
 
-The single quantity enforced each step is total box sulfur: the SO4 in the 40
-aerosol mass bins plus gas-phase H2SO4 must equal the previous total plus the
-H2SO4 mass injected from CESM that step (a closed-form function of the cond
-vector). The network is free to *partition* that budget across bins and the gas
-phase however it likes. The forcing term is per-step, **not** a running sum —
-TOMAS hard-resets gas-phase H2SO4 to the CESM value at the start of every step,
-so a summed-forcing constraint would be wrong. See `docs/DATA.md`.
+fp16 autocast reproduces fp32 within rounding at every horizon (no non-finite outputs over
+5 populations × 14-day chains). **bf16 is not lossless**: day-14 number p90 widens from 71 to
+84 % on the d256 model, so `load_model` refuses it. `torch.compile(mode="reduce-overhead")`
+halves the half-precision cost; it does nothing for fp32. Batch size must be constant for a
+compiled graph; `rollout` pads the last batch.
 
-### Training curriculum
+## Known limits
 
-The released model is the last of a sequence of stages that grow the rollout
-horizon while warm-starting each stage from the previous best. Training a long
-horizon from scratch is unstable (exposure bias / gradient blow-ups); ramping it
-is not.
+- **Nucleation-burst number.** A pulse of SO₂ into clean, cold air nucleates within minutes;
+  the emulator must infer the burst from the forcing and lands 20–60 % off in total number
+  during the burst, while total mass stays within a few percent. Quiet and coagulating cells
+  are at the percent level.
+- **SO₂ source channel.** The continuous-source forcing channel (index 4) is unstable on the
+  d384 checkpoint: SO₂ is taken up ~2× too fast in the first block and explodes in the second.
+  Apply injections to the gas state between steps instead (which is what the coupled climate
+  model does) and leave channel 4 at its zero value.
+- **Initial conditions** must be bin-consistent (mass per particle inside each bin's mass
+  range). States produced by TOMAS are; a modal-to-sectional mapping that spreads number and
+  mass with the same pdf is not, and is out of distribution.
 
-| Stage | chunk_len | init from |
-|------:|:---------:|-----------|
-| 1     | 2         | scratch   |
-| 2     | 4         | stage 1   |
-| 3     | 8         | stage 2   |
-| 4     | 12        | stage 3   |
-| 5     | 32        | stage 4   |
-| **6** | **60**    | **stage 5** (released model) |
+## Training recipe
 
-Each stage uses a **hybrid loss**: log-MSE (with an inverse-variance weighting
-floored to avoid amplifying empty-bin noise) plus a clipped relative-error term
-(`--relerr-weight 0.4`) to keep the metric the model is judged on in the
-objective. Pushforward steps (`--pushforward-steps 4`) train multi-step
-composition directly. The exact final-stage hyperparameters are baked into
-`scripts/train.sh` and into `best_model.pt`'s saved `args`.
+Data: 6-hour windows and 14-day chains from a CESM/WACCM-CARMA-driven TOMAS-JAX box corpus
+(global background, stratosphere, SAI pulse injection, continuous injection, idealized
+populations; ~12 M scenarios). Not included here.
 
-> **Multi-GPU caveat.** `TomasMultiHeadMLP` under DDP **must** set
-> `broadcast_buffers=False` (the trainer does). With rank-0-only validation and
-> the default `broadcast_buffers=True`, NCCL desyncs and surfaces as spurious
-> CUDA "index out of bounds" asserts.
+1. 6-hour pre-training from scratch: MSE on normalized log-states + total-number / total-mass
+   terms + 4× weight on the 16 smallest bins (`training/frontier_transformers.py`, `ARCH=bintf`).
+2. K-curriculum chain training, K = 2 → 48 blocks (12 h → 14 days), warm-started from step 1,
+   burst-active chains oversampled ×3, data-parallel on 5 GPUs (`training/frontier_bintf_kchain.py`).
+3. Rebalanced finishing (one K = 48 stage, 8 epochs): 6-hour term weight ×8, per-block chain loss
+   normalized by the detached block error so early blocks contribute as much gradient as late
+   ones, and a teacher-forced one-step loss from every true state along each chain.
+4. Weight average of the three best epochs by day-14 totals (`training/frontier_bintf_ckpt_avg.py`).
 
----
+The `training/` directory is the code as run, unmodified. It depends on the internal data
+layout (`dataset_v8.py`, `frontier_common.py`) and on absolute paths of the training machine;
+it is included for reference, not as a runnable pipeline.
 
-## Data
+## Files
 
-Training data is **not** included (it is ~1 M scenarios). Each scenario is a
-6-hour TOMAS-JAX box-model simulation seeded from a real CESM2 grid cell, with
-the atmospheric environment (T, RH, OH, SO2 → H2SO4) **evolving hour-by-hour**
-from CESM and interpolated to the 60-second step. Layout expected by the loader:
+| file | purpose |
+|---|---|
+| `bintf_model.py` | the architecture (identical to training) |
+| `normalization.py` | state / forcing layout, units, floors, log transform, normalization stats |
+| `inference.py` | `load_model` (fp16 + compile) and chained `rollout` |
+| `example.py` | one box, SO₂ pulse, 48 h, prints the time course |
+| `checkpoints/` | the two weight files and `norm_stats.npz` |
+| `training/` | training, finishing and checkpoint-averaging scripts as run |
 
-```
-v4_repr_1M/
-  t<cellid>/batch_s<scenario>_b<batch>.npz   # Nk, Mk, Gc, evolving cond
-```
-
-`docs/DATA.md` documents the generation pipeline and schema in full.
-
-### Why the floor matters
-
-Empty size bins sit at a numerical floor (`LOG_EPS = 1e-30`; coarse bins often
-park at ~`1e-5` for >50 % of a rollout). A relative-error metric over those bins
-divides by ~floor and explodes meaninglessly. `evaluate.py` therefore masks any
-bin that is at the floor for more than `--empty-frac` (default 50 %) of the
-horizon, so the reported median reflects bins that actually carry signal. This
-is a metric-side convention, not a clamp on the data.
-
----
-
-## Status and roadmap
-
-This emulator is under active development. Accuracy is being actively improved;
-current focus areas:
-
-- **The `t=0` nucleation transient** — the dominant contributor to 6-hour error.
-  Finer first-step resolution and time conditioning are being explored.
-- **The core/coarse size-range boundary**, where the multi-head split currently
-  introduces a localized artifact.
-
-By design the model conserves **sulfur mass**, not number — nucleation and
-coagulation legitimately change particle number, which the network predicts.
-
----
-
-## License
-
-MIT — see `LICENSE`.
+Other branches of this repository hold earlier model generations (`main`: 60-s multi-head
+MLP; `dt-champion`: Δt-conditioned MLP; `axial-aug5`: axial attention).
